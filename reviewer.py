@@ -1,5 +1,6 @@
 import asyncio
-from claude_agent_sdk import query, ClaudeAgentOptions
+import json
+import subprocess
 from github_client import PRInfo
 
 
@@ -19,7 +20,7 @@ For each issue found, specify:
 
 If the PR looks good, say so briefly and note any minor suggestions.
 
-IMPORTANT: Output your review as JSON with this exact structure:
+IMPORTANT: Output your review as JSON with this exact structure and nothing else:
 {
   "summary": "Brief overall assessment of the PR",
   "issues": [
@@ -35,7 +36,7 @@ IMPORTANT: Output your review as JSON with this exact structure:
 
 
 async def review_pr(pr: PRInfo) -> str:
-    """Send PR diff to Claude for review and return the raw result text."""
+    """Send PR diff to Claude CLI for review and return the result."""
     prompt = f"""Review this pull request:
 
 **Repository:** {pr.repo_name}
@@ -52,45 +53,41 @@ async def review_pr(pr: PRInfo) -> str:
 
 Provide your review as the JSON structure described in your instructions."""
 
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        allowed_tools=[],
-        max_turns=1,
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string"},
-                    "issues": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "severity": {"type": "string", "enum": ["critical", "warning", "suggestion"]},
-                                "file": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "required": ["severity", "file", "description"],
-                        },
-                    },
-                    "verdict": {"type": "string", "enum": ["approve", "request_changes", "comment"]},
-                },
-                "required": ["summary", "issues", "verdict"],
-            },
-        },
+    result = await asyncio.to_thread(_run_claude, prompt)
+
+    # Try to parse as JSON
+    try:
+        return json.loads(result)
+    except json.JSONDecodeError:
+        # Try to extract JSON from markdown code blocks
+        if "```" in result:
+            for block in result.split("```"):
+                block = block.strip()
+                if block.startswith("json"):
+                    block = block[4:].strip()
+                try:
+                    return json.loads(block)
+                except json.JSONDecodeError:
+                    continue
+        return result
+
+
+def _run_claude(prompt: str) -> str:
+    """Call the claude CLI in print mode."""
+    result = subprocess.run(
+        [
+            "claude",
+            "-p",
+            "--output-format", "text",
+            "--system-prompt", SYSTEM_PROMPT,
+            prompt,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
 
-    result_text = None
-    structured = None
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude CLI failed (exit {result.returncode}): {result.stderr}")
 
-    async for message in query(prompt=prompt, options=options):
-        if hasattr(message, "structured_output") and message.structured_output is not None:
-            structured = message.structured_output
-        if hasattr(message, "result") and message.result is not None:
-            result_text = message.result
-
-    # Prefer structured output if available
-    if structured is not None:
-        return structured
-    return result_text
+    return result.stdout.strip()
